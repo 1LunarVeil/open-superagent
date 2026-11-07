@@ -145,9 +145,18 @@ describe('ticket workspace', () => {
     const plain = join(dir, 'plain')
     mkdirSync(plain, { recursive: true })
     const directory = join(root, 'ticket-plain')
-    mkdirSync(directory, { recursive: true })
     const notes = await prepareWorkspace({ directory, workRoot: root, worktree: true, projectDir: plain, timeoutMs: 60_000 })
     expect(notes.join(' ')).toContain('not a git work tree')
+    // The directory must exist: the worker prompt names it, and a subagent cannot create its own workspace.
+    expect(readdirSync(directory)).toEqual([])
+  })
+
+  it('creates the ticket directory even when worktrees are switched off', async () => {
+    const repo = initRepo()
+    const root = join(dir, 'work-off')
+    const directory = join(root, 'ticket-off')
+    await prepareWorkspace({ directory, workRoot: root, worktree: false, projectDir: repo, timeoutMs: 60_000 })
+    // Worktrees are off, so the checkout is skipped, but the directory the prompt names must exist.
     expect(readdirSync(directory)).toEqual([])
   })
 

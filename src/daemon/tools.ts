@@ -198,6 +198,9 @@ export function registerTools(server: McpServer, runtime: Runtime): void {
     // First let every pass and effect finish so actions written by committed work are all in the queue.
     await runtime.passes.idle()
     runtime.actions.prune()
+    // A candidate card whose Eval was decided or expired meanwhile is no longer actionable: handing it out would make the
+    // orchestrator retry a finished assessment forever (eval_read raises noCandidate and the row is re-leased each cycle).
+    runtime.actions.dropStaleAssessments(triggerId => runtime.engine.candidate(triggerId) !== undefined)
     const actions = runtime.actions.take()
     if (!actions.length) {
       // A lease still held by this same session is not "no work": say when it returns, so the orchestrator does not end

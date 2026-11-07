@@ -7,7 +7,7 @@
  * Engine back are allowed.
  */
 import { mkdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { Later } from '../persist/effects.ts'
 import type { Effects } from '../persist/effects.ts'
 import type { Assignment, EngineForExecutor, Executor, Ticket, Trigger } from '../kernel/index.ts'
@@ -200,14 +200,17 @@ export class ZcodeExecutor implements Executor {
     const busy = deps.store.tickets.active().filter(item => !item.ended && item.assignments.some(running => running.state === 'running')).length
     if (assignment.state !== 'running' && busy >= deps.slots()) throw new Later('All worker slots are busy')
     const directory = ticket.execution?.directory ?? join(deps.workRoot(), ticketId.slice(0, 12))
+    // A ticket keeps the directory it was accepted with, so validate it against its own root: changing
+    // `executor.directory` must not make every already-accepted ticket fail its path check.
+    const root = ticket.execution?.directory ? dirname(ticket.execution.directory) : deps.workRoot()
     // Preparation is a fact recorded on the ticket, not an inference from assignment state: a retried ticket whose first
     // preparation failed must be able to prepare again once the person fixed the environment.
     if (!ticket.execution?.preparedAt) {
       try {
-        mkdirSync(deps.workRoot(), { recursive: true })
+        mkdirSync(root, { recursive: true })
         const notes = await prepareWorkspace({
           directory,
-          workRoot: deps.workRoot(),
+          workRoot: root,
           worktree: deps.worktree(),
           projectDir: deps.projectDir(),
           ref: deps.baseRef(),

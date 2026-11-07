@@ -107,6 +107,17 @@ describe('Settings', () => {
     expect(changes[0]!.to).toBe(policyVersion(settings.get()))
   })
 
+  it('merges policy.sources one level deeper so one Source save keeps the others', () => {
+    const { engine } = engineStub()
+    const settings = new Settings(store, engine, () => scope)
+    settings.save('policy', { sources: { manual: { allowed: [{ id: 'a' }] }, other: { allowed: [{ id: 'b' }] } } }, 'tool')
+    // Saving only `manual` must not drop `other`.
+    settings.save('policy', { sources: { manual: { allowed: [{ id: 'c' }] } } }, 'tool')
+    const sources = settings.get().policy.sources
+    expect(sources.manual?.allowed).toEqual([{ id: 'c' }])
+    expect(sources.other?.allowed).toEqual([{ id: 'b' }])
+  })
+
   it('keeps a history of saved revisions', () => {
     const { engine } = engineStub()
     const settings = new Settings(store, engine, () => scope)
