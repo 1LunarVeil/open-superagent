@@ -24,9 +24,11 @@ export declare class Runtime {
     readonly effects: Effects;
     readonly actions: Actions;
     private readonly board;
-    private readonly releaseLock?;
+    private releaseLock?;
     private readonly stopped;
     private readonly log;
+    private lead;
+    private takeover?;
     private stoppingFlag;
     private stopPromise?;
     /** Built by `initialize`, which runs before any Engine command or MCP tool can run. */
@@ -38,13 +40,15 @@ export declare class Runtime {
     private passesRef?;
     private constructor();
     /**
-     * Creates the runtime: makes the state directory private to the user, locks it against a second daemon, and opens the
-     * SQLite Store. The lock has no periodic `update` refresh here — the type has no `null` for it and omitting it behaves
-     * the same, refreshing at half the stale interval while this process lives.
-     * @throws StateLocked when another daemon instance holds the state directory.
+     * Creates the runtime and opens the Store. The state directory lock is not a gate: ZCode starts one MCP server per
+     * session, so several daemons legitimately share one project's database. The first one becomes the leader — the only
+     * process that dispatches effects and runs passes — and the rest serve tools against the same SQLite file, taking over
+     * the leadership if it closes. Refusing to start instead would leave every second session with no tools at all.
      */
     static open(options: RuntimeOptions): Promise<Runtime>;
-    /** Wires the domain and its ports; called once, before the MCP server connects and before `passes.start()`. */
+    /** Whether this process owns scheduling (passes and effects) for the state directory. */
+    get isLeader(): boolean;
+    /** Wires the domain and its ports; called once, before the MCP server connects and before scheduling starts. */
     initialize(): Promise<void>;
     /**
      * Seeds the local operator into the manual Source's allowlist on first run. Without it the person at the keyboard is an
@@ -59,6 +63,28 @@ export declare class Runtime {
     healthSnapshot(): Readonly<Record<string, Health>>;
     /** Idempotent stop; concurrent or repeated calls share one shutdown. */
     stop(): Promise<void>;
+    /**
+     * Starts scheduling when this process leads: passes and effect dispatch. A follower does nothing here, because another
+     * process already dispatches for the same database and running two dispatchers would duplicate effects.
+     */
+    /**
+     * Starts scheduling when this process leads, and otherwise keeps trying to take leadership over from whichever session
+     * currently has it. A follower still serves every tool against the shared database; taking over only matters for effects,
+     * which must have exactly one dispatcher.
+     */
+    startScheduling(): void;
+    /** True once this runtime either leads or is polling to take over from the session that does. */
+    get scheduling(): boolean;
+    /**
+     * Joins the running effects and passes, so a tool call that depends on them observes their outcome. A follower has no
+     * dispatcher of its own; it waits on the leader indirectly by re-reading the database in the caller.
+     */
+    private settle;
+    /**
+     * Keeps trying to become the leader while another session owns scheduling. When it succeeds, effects that piled up
+     * while nobody dispatched start moving again, which is what makes closing the original session harmless.
+     */
+    private watchForLeadership;
     /** Stops the passes, drains the effect queue, then closes the Store before releasing the lock, so another process cannot open the database mid-write. */
     private shutdown;
     /** The Settings instance, once built; the Engine's policy reads it lazily because Settings is wired after the Engine. */

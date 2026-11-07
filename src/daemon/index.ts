@@ -16,7 +16,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import { Runtime, StateLocked } from './runtime.ts'
+import { Runtime } from './runtime.ts'
 import { registerTools } from './tools.ts'
 
 /** The plugin's own package version, so the MCP handshake never drifts from the manifest. */
@@ -80,8 +80,9 @@ async function main(): Promise<void> {
   const server = new McpServer({ name: 'open-superagent', version: packageVersion() })
   registerTools(server, runtime)
   await server.connect(new StdioServerTransport())
-  // The passes run only once the server is up, so the first tick sees a started daemon and no trigger can arrive earlier.
-  runtime.passes.start()
+  // Scheduling starts only once the server is up, so the first tick sees a started daemon. The `superagent_tick` tool
+  // also starts it on first use, which is how a follower picks scheduling up when it takes over the state directory.
+  runtime.startScheduling()
   let stopping = false
   const shutdown = (): void => {
     // The host closes the transport and then may kill the process; the lock and the database must still be released, or
@@ -101,12 +102,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((error: unknown) => {
-  if (error instanceof StateLocked) {
-    // A second session in the same project shares this state directory; only one daemon may own it.
-    process.stderr.write('open-superagent: another daemon already owns ' + stateDir
-      + '. Close the other session in this project, or set OPEN_SUPERAGENT_STATE_DIR to a separate directory.\n')
-    process.exit(3)
-  }
   process.stderr.write('open-superagent failed to start: ' + String(error) + '\n')
   process.exit(1)
 })

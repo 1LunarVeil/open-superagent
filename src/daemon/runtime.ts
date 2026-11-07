@@ -49,9 +49,17 @@ interface StorageParts {
   board: HealthBoard
   effects: Effects
   actions: Actions
-  release: () => Promise<void>
+  release?: () => Promise<void>
+    /** Whether this process owns the state directory; only the owner runs passes and effects. */
+  leader: boolean
   log: (message: string) => void
 }
+
+/**
+ * How often a follower retries the state-directory lock. When the owning session closes, one follower takes over so
+ * effects keep being dispatched without the person noticing.
+ */
+const TAKEOVER_MS = 5_000
 
 export class Runtime {
   readonly stateDir: string
@@ -60,9 +68,11 @@ export class Runtime {
   readonly effects: Effects
   readonly actions: Actions
   private readonly board: HealthBoard
-  private readonly releaseLock?: () => Promise<void>
+  private releaseLock?: () => Promise<void>
   private readonly stopped = new AbortController()
   private readonly log: (message: string) => void
+  private lead: boolean
+  private takeover?: ReturnType<typeof setInterval>
   private stoppingFlag = false
   private stopPromise?: Promise<void>
   /** Built by `initialize`, which runs before any Engine command or MCP tool can run. */
@@ -81,39 +91,37 @@ export class Runtime {
     this.effects = parts.effects
     this.actions = parts.actions
     this.releaseLock = parts.release
+    this.lead = parts.leader
     this.log = parts.log
   }
 
   /**
-   * Creates the runtime: makes the state directory private to the user, locks it against a second daemon, and opens the
-   * SQLite Store. The lock has no periodic `update` refresh here — the type has no `null` for it and omitting it behaves
-   * the same, refreshing at half the stale interval while this process lives.
-   * @throws StateLocked when another daemon instance holds the state directory.
+   * Creates the runtime and opens the Store. The state directory lock is not a gate: ZCode starts one MCP server per
+   * session, so several daemons legitimately share one project's database. The first one becomes the leader — the only
+   * process that dispatches effects and runs passes — and the rest serve tools against the same SQLite file, taking over
+   * the leadership if it closes. Refusing to start instead would leave every second session with no tools at all.
    */
   static async open(options: RuntimeOptions): Promise<Runtime> {
     const { stateDir, projectDir } = options
     const log = options.log ?? ((message: string) => { process.stderr.write('open-superagent: ' + message + '\n') })
     mkdirSync(stateDir, { recursive: true, mode: 0o700 })
-    let release: (() => Promise<void>) | undefined
-    try {
-      release = await lock(stateDir, { stale: 30_000, realpath: false })
-    } catch {
-      throw new StateLocked()
-    }
+    const release = await lock(stateDir, { stale: 30_000, realpath: false }).catch(() => undefined)
     try {
       const store = new Store(join(stateDir, 'open-superagent.sqlite'), error => log(String(error)))
       const board = new HealthBoard()
       const effects = new Effects(store, board)
       const actions = new Actions(store)
-      return new Runtime({ stateDir, projectDir, store, board, effects, actions, release, log })
+      return new Runtime({ stateDir, projectDir, store, board, effects, actions, ...(release ? { release } : {}), leader: !!release, log })
     } catch (error) {
-      // Release the lock so a later attempt in another process can take it.
-      await release().catch(() => {})
+      await release?.().catch(() => {})
       throw error
     }
   }
 
-  /** Wires the domain and its ports; called once, before the MCP server connects and before `passes.start()`. */
+  /** Whether this process owns scheduling (passes and effects) for the state directory. */
+  get isLeader(): boolean { return this.lead }
+
+  /** Wires the domain and its ports; called once, before the MCP server connects and before scheduling starts. */
   async initialize(): Promise<void> {
     const assessor = this.assessor = new MasterAssessor()
     const executor = this.executor = new ZcodeExecutor()
@@ -167,18 +175,14 @@ export class Runtime {
       configured: () => true,
       closing: () => this.stoppingFlag,
     })
-    // Effects dispatch only between start and drain, so rows queued by an earlier run wait until now; passes themselves
-    // start later, once the MCP server is connected (the entry point calls `passes.start()`).
-    this.effects.start()
+    // Queue rows written by an earlier run wait until a dispatcher starts. Only the leader dispatches: a follower shares
+    // the same database and must not run a second copy of every effect.
+    if (this.lead) this.effects.start()
     // A lease in the database belongs to a session that no longer exists (one daemon owns a state directory), so release
     // them all: otherwise the first tick in the new session answers "No pending actions" while work waits out the lease.
     const released = this.actions.releaseAllLeases()
     if (released) this.log('Released ' + String(released) + ' lease(s) held by a previous session')
     this.seedLocalOperator()
-    // The domain may say a worker is running while no worker ever received it (the host restarted, or the session died
-    // between the tick and the spawn). Reconcile once, before new work can be dispatched.
-    executor.reconcile()
-    this.actions.prune()
   }
 
   /**
@@ -214,11 +218,61 @@ export class Runtime {
     return this.stopPromise ??= this.shutdown()
   }
 
+  /**
+   * Starts scheduling when this process leads: passes and effect dispatch. A follower does nothing here, because another
+   * process already dispatches for the same database and running two dispatchers would duplicate effects.
+   */
+  /**
+   * Starts scheduling when this process leads, and otherwise keeps trying to take leadership over from whichever session
+   * currently has it. A follower still serves every tool against the shared database; taking over only matters for effects,
+   * which must have exactly one dispatcher.
+   */
+  startScheduling(): void {
+    if (this.stoppingFlag) return
+    if (this.lead) { this.effects.start(); this.passesRef?.start() }
+    else this.watchForLeadership()
+  }
+
+  /** True once this runtime either leads or is polling to take over from the session that does. */
+  get scheduling(): boolean { return this.lead || !!this.takeover }
+
+  /**
+   * Joins the running effects and passes, so a tool call that depends on them observes their outcome. A follower has no
+   * dispatcher of its own; it waits on the leader indirectly by re-reading the database in the caller.
+   */
+  private async settle(): Promise<void> {
+    if (this.lead) await this.passesRef?.idle()
+  }
+
+  /**
+   * Keeps trying to become the leader while another session owns scheduling. When it succeeds, effects that piled up
+   * while nobody dispatched start moving again, which is what makes closing the original session harmless.
+   */
+  private watchForLeadership(): void {
+    if (this.lead || this.takeover) return
+    this.takeover = setInterval(() => {
+      if (this.lead || this.stoppingFlag) return
+      void lock(this.stateDir, { stale: 30_000, realpath: false }).then(release => {
+        if (!release) return
+        this.releaseLock = release
+        this.lead = true
+        this.log('Took over scheduling for ' + this.stateDir)
+        this.effects.start()
+        this.passesRef?.start()
+      }, () => undefined)
+    }, TAKEOVER_MS)
+    // Do not keep the process alive just to poll for leadership.
+    this.takeover.unref?.()
+  }
+
   /** Stops the passes, drains the effect queue, then closes the Store before releasing the lock, so another process cannot open the database mid-write. */
   private async shutdown(): Promise<void> {
+    if (this.takeover) { clearInterval(this.takeover); this.takeover = undefined }
     await this.passesRef?.stop()
     try {
-      await this.effects.drain()
+      // Only the leader dispatches effects, so only it has to drain them; a follower closing must not wait for the
+      // leader's queue.
+      if (this.lead) await this.effects.drain()
     } finally {
       try { this.store.close() } finally {
         try { await this.releaseLock?.() } finally { this.stopped.abort() }

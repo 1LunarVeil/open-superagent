@@ -162,6 +162,34 @@ describe('end to end over stdio', () => {
 })
 
 describe('daemon lifecycle', () => {
+  it('serves tools to a second session in the same project instead of refusing to start', async () => {
+    // ZCode starts one MCP server per session. Refusing the second one left that session with no superagent tools at all,
+    // which looks like "the plugin is not installed". Both sessions must serve tools over one shared database; only
+    // scheduling is exclusive.
+    const sharedDir = join(dir, 'shared')
+    const openSession = async (name: string) => {
+      const client = new Client({ name, version: '0.0.0' })
+      await client.connect(new StdioClientTransport({
+        command: process.execPath,
+        args: [join(root, 'lib', 'daemon', 'index.js')],
+        env: { ...process.env, OPEN_SUPERAGENT_STATE_DIR: sharedDir, OPEN_SUPERAGENT_PROJECT_DIR: repo },
+      }))
+      return client
+    }
+    const first = await openSession('shared-1')
+    const second = await openSession('shared-2')
+    expect((await first.listTools()).tools.map(tool => tool.name)).toContain('superagent_tick')
+    expect((await second.listTools()).tools.map(tool => tool.name)).toContain('superagent_tick')
+    // The follower writes to the shared database, and the leader's queue reflects it.
+    await second.callTool({ name: 'superagent_trigger_inject', arguments: {
+      threadId: 'shared-thread', actorId: 'operator', text: 'Fix a typo in README.md.', human: true, addressed: 'direct' } })
+    const tickCall = await first.callTool({ name: 'superagent_tick', arguments: {} })
+    const tick = String((tickCall.content as { text?: string }[])[0]?.text)
+    expect(tick).toContain('assess_candidate')
+    await first.close()
+    await second.close()
+  }, 60_000)
+
   it('releases the state lock when the client disconnects, so the same project can start again', async () => {
     // A lock that outlives the session would make every later session in this project fail with exit 3, which is the
     // difference between "restart the app" and "the plugin is broken". The stale window is 30 s, so a test that passes

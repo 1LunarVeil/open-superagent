@@ -7,7 +7,8 @@ versioned Policy, turns authorized ones into Tickets, and runs each Ticket in it
 the original conversation.
 
 Internalized from DeepSeek's [`dsh-superagent-prototype`](https://github.com/deepseek-ai/dsh-superagent-prototype) (MIT;
-see [NOTICE.md](NOTICE.md) for the full adaptation list). The upstream domain kernel (`src/kernel/`) is a faithful port of
+see [NOTICE.md](NOTICE.md) for the full adaptation list). This plugin reimplements the host driver layer for ZCode.
+The upstream domain kernel (`src/kernel/`) is a faithful port of
 its zero-dependency core, including its 144-test suite; the host drivers are new code that maps the same port interfaces
 onto ZCode: an MCP daemon instead of a DSH bundle, the main session as orchestrator, and a plugin-provided subagent as the
 worker. [docs/alignment-0.1.1.md](docs/alignment-0.1.1.md) records capability parity against upstream, and where this

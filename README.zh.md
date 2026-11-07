@@ -2,7 +2,7 @@
 
 面向单仓库的主动式 agent 内核，打包为 ZCode 插件。它监听请求（当前通过手动注入工具；GitHub 轮询源将在后续阶段接入），在版本化 Policy 下裁决，把获准的请求变成工单（Ticket），每张工单在独立的 worker 子代理中执行，并把结果写回原对话。
 
-内化自 DeepSeek 的 [`dsh-superagent-prototype`](https://github.com/deepseek-ai/dsh-superagent-prototype)（MIT；完整适配清单见 [NOTICE.md](NOTICE.md)）。域内核（`src/kernel/`）是对其零依赖核心的忠实移植，包括 144 个测试的完整测试套件；宿主驱动层是新代码，把同样的端口接口映射到 ZCode：用 MCP daemon 替代 DSH bundle，用主会话充当 Orchestrator（编排器），用插件自带的子代理充当 Worker（执行器）。与上游的能力对照及有意差异记录在 [docs/alignment-0.1.1.md](docs/alignment-0.1.1.md)。
+内化自 DeepSeek 的 [`dsh-superagent-prototype`](https://github.com/deepseek-ai/dsh-superagent-prototype)（MIT；完整适配清单见 [NOTICE.md](NOTICE.md)）。本插件为 ZCode 重新实现了宿主驱动层。域内核（`src/kernel/`）是对其零依赖核心的忠实移植，包括 144 个测试的完整测试套件；宿主驱动层是新代码，把同样的端口接口映射到 ZCode：用 MCP daemon 替代 DSH bundle，用主会话充当 Orchestrator（编排器），用插件自带的子代理充当 Worker（执行器）。与上游的能力对照及有意差异记录在 [docs/alignment-0.1.1.md](docs/alignment-0.1.1.md)。
 
 ## 架构
 
