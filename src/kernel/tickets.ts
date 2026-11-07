@@ -227,6 +227,14 @@ export class Tickets extends EnginePart {
     for (const id of tickets) this.emit('thread.unsubscribed', { threadKey: current.key, ticketId: id, by, ...(reason ? { reason } : {}) })
     return true
   }
+  /** Record that the ticket's workspace is ready, so a retry never repeats a preparation that succeeded. */
+  markPrepared(ticketId: string, at: string): void {
+    const ticket = this.require(ticketId)
+    if (!ticket.execution) return
+    ticket.execution.preparedAt = at
+    ticket.updatedAt = at
+    this.repo.tickets.save(ticket)
+  }
   /**
    * Add an Input once (idempotently) and ask the Executor to deliver it, or to launch again a pending Assignment whose launch
    * failed once no person is waited for: a Policy change alone does not launch it again.

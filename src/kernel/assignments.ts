@@ -69,6 +69,18 @@ export class Assignments extends EnginePart {
     runningAssignment(ticket)!.idleAt = this.now()
     this.repo.tickets.save(ticket)
   }
+  /**
+   * Records that a worker took the assignment up, `worker-<assignmentId>` style evidence that it is really running.
+   * Idempotent: the first claim wins, so a second read of the same ticket does not move the timestamp.
+   */
+  claimed(ticketId: string, assignmentId: string): void {
+    const ticket = this.require(ticketId)
+    const assignment = ticket.assignments.find(item => item.id === assignmentId)
+    if (!assignment || assignment.state === 'ended' || assignment.claimedAt) return
+    assignment.claimedAt = this.now()
+    ticket.updatedAt = assignment.claimedAt
+    this.repo.tickets.save(ticket)
+  }
   deliveryFailed(ticketId: string, assignmentId: string, error: string): void {
     const ticket = this.running(ticketId, assignmentId)
     if (!ticket) return
@@ -84,6 +96,9 @@ export class Assignments extends EnginePart {
     const ticket = this.running(ticketId, assignmentId)
     const running = ticket && runningAssignment(ticket)
     if (!ticket || !running) return
+    // A worker that read its assignment is alive: the host cannot prove otherwise, and restarting it would put a second
+    // worker into the same directory. Only an assignment nobody ever claimed is restarted as interrupted.
+    if (running.claimedAt) { if (ticket.undelivered.length) this.options.executor.deliver(ticket, running); return }
     const report = running.report
     const busy = !!running.deliveredAt && !!report && running.deliveredAt >= report.at
     const settled = !!report && ['waiting', 'ready', 'blocked', 'failed'].includes(report.state) && !busy

@@ -6,7 +6,8 @@
  */
 try {
   process.stdout.write(JSON.stringify({
-    systemMessage: 'open-superagent daemon is connected. Call superagent_tick when starting a session or when idle to pick up pending orchestrator actions.',
+    systemMessage: 'open-superagent is available. Call superagent_tick to pick up pending orchestrator actions; after'
+      + ' handling a batch, call superagent_tick_ack with the actionIds you finished.',
   }) + '\n')
 } catch {
   // Silent by design: the hook output is advisory only.

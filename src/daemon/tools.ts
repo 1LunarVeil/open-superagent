@@ -1,16 +1,17 @@
 /**
- * The MCP tools of the open-superagent daemon, in three batches: the orchestrator's status, tick (the pending-action
- * handout), settings, trigger injection, and health; the orchestrator's assessment, routing, and full-record reads
- * (eval_read, eval_decide, route, read, reply, ticket_note); and the worker protocol its subagents run tickets through
- * (worker_read, worker_ack, worker_report, worker_handback, worker_thread_unrelated, worker_thread_follow). Port note:
- * these replace upstream's main-Session tools (`orchestrator_*`), which its Session host registered in-process; a ZCode
- * main session reaches the daemon over MCP instead, and the assessment/report protocols live in the open-superagent skill
- * the session follows, not in these handlers.
+ * The MCP tools of the open-superagent daemon, in four batches: the orchestrator's status, tick (the pending-action
+ * handout and its acknowledgement), settings, trigger injection, and health; the orchestrator's assessment, routing, and
+ * full-record reads (eval_read, eval_decide, route, read, reply, ticket_note); the operator's ticket controls
+ * (ticket_retry, ticket_stop, ticket_status, thread_unsubscribe, decision_dismiss, trigger_requeue); and the worker
+ * protocol its subagents run tickets through (worker_read, worker_ack, worker_report, worker_handback,
+ * worker_thread_unrelated, worker_thread_follow). Port note: these replace upstream's main-Session tools
+ * (`orchestrator_*`), which its Session host registered in-process; a ZCode main session reaches the daemon over MCP
+ * instead, and the assessment/report protocols live in the open-superagent skill the session follows, not in these handlers.
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { UserError, key, latestAssignment, latestReport, ticketStage, threadKey } from '../kernel/index.ts'
+import { UserError, canRetry, key, latestAssignment, latestReport, ticketStage, threadKey } from '../kernel/index.ts'
 import type { Ticket, Trigger, WorkerReport } from '../kernel/index.ts'
 import { assessmentOutcome } from '../kernel/policy.ts'
 import type { Assessment, SettingsSave } from '../kernel/policy.ts'
@@ -23,7 +24,8 @@ const SETTINGS_BLOCKS: SettingsSave[] = ['policy', 'eval', 'executor', 'source:m
 /**
  * The body of `superagent_eval_decide`, aligned field for field with the upstream assessment interface: the orchestrator
  * judges every enabled rule exactly once, states the three direction facts, and for an accept adds the intent evidence,
- * the acknowledgement, and the short directory name.
+ * the acknowledgement, and the short directory name. Only an accept needs the ticket fields; an ignore or an unavailable
+ * decision carries its reason and nothing else.
  */
 const EvalDecideSchema = z.strictObject({
   triggerId: z.string().min(1).describe('The trigger to decide, by its id from the candidate card.'),
@@ -36,9 +38,9 @@ const EvalDecideSchema = z.strictObject({
     requires_design_decision: z.boolean(),
     evidence: z.string().describe('The source statements that establish the direction facts; do not invent evidence to make the booleans pass.'),
   }),
-  title: z.string().describe('The ticket title for an accept; unused otherwise.'),
-  scope: z.string().describe('The mandate scope for an accept, such as small.'),
-  reason: z.string().describe('Why, recorded on the decision.'),
+  reason: z.string().min(1).describe('Why, recorded on the decision.'),
+  title: z.string().optional().describe('For an accept, the ticket title.'),
+  scope: z.string().optional().describe('For an accept, the mandate scope, such as small.'),
   intent_evidence: z.string().nullable().optional().describe('For an accept, the three admission facts with their source quotes.'),
   acknowledgement: z.string().nullable().optional().describe('For an accept, one short sentence naming the change and intended result, in the source language.'),
   worktree_name: z.string().optional().describe('For an accept, a short English directory name independent of the title.'),
@@ -57,6 +59,7 @@ const RouteItemSchema = z.object({
   acknowledgement: z.string().optional().describe('For accept, one short sentence naming the change and intended result, in the source language.'),
 })
 type RouteItem = z.infer<typeof RouteItemSchema>
+
 
 /**
  * Runs a tool body into a text result: a `UserError` (an expected refusal or missing record the model should see) becomes
@@ -128,7 +131,11 @@ function readResource(runtime: Runtime, resource: string): Record<string, unknow
     if (!trigger) throw new UserError('unknownTrigger')
     return { trigger, disposition: runtime.store.triggers.disposition(id) }
   }
-  if (kind === 'thread') return { thread: runtime.store.threads.get(id), triggers: runtime.store.read.threadTriggers(id, 50) }
+  if (kind === 'thread') {
+    const thread = runtime.store.threads.get(id)
+    if (!thread) throw new UserError('unknownThread', { thread: id })
+    return { thread, triggers: runtime.store.read.threadTriggers(id, 50) }
+  }
   if (kind === 'ticket') {
     const ticket = runtime.store.tickets.get(id)
     if (!ticket) throw new UserError('unknownTicket')
@@ -184,16 +191,36 @@ export function registerTools(server: McpServer, runtime: Runtime): void {
   server.registerTool('superagent_tick', {
     title: 'open-superagent tick',
     description: 'Take the orchestrator\'s pending actions: candidate cards to assess, workers to spawn, inputs to'
-      + ' deliver, and reply receipts. Call at session start and whenever idle; the open-superagent skill defines the'
-      + ' protocols each action follows.',
+      + ' deliver, and reply receipts. Call at session start and whenever idle. The actions stay leased to you for ten'
+      + ' minutes and are handed out again if you never finish them, so call superagent_tick_ack with the actionIds you'
+      + ' completed before ending your turn. The open-superagent skill defines the protocols each action follows.',
   }, () => textResult(async () => {
     // First let every pass and effect finish so actions written by committed work are all in the queue.
     await runtime.passes.idle()
+    runtime.actions.prune()
     const actions = runtime.actions.take()
-    if (!actions.length) return 'No pending actions.'
-    return 'Pending actions for the orchestrator. Act on each in order; the open-superagent skill defines the protocols.\n'
-      + JSON.stringify(actions, null, 2)
+    if (!actions.length) {
+      // A lease still held by this same session is not "no work": say when it returns, so the orchestrator does not end
+      // its turn believing the queue is empty while handed-out work waits out its lease.
+      const leased = runtime.actions.leased()
+      if (leased.count) return 'No new actions. ' + String(leased.count) + ' action(s) are still leased to this session'
+        + (leased.until ? ', returning after ' + leased.until : '') + ' if you do not finish them.'
+      return 'No pending actions.'
+    }
+    return 'Pending actions for the orchestrator. Act on each in order, then call superagent_tick_ack with the actionIds'
+      + ' you completed; the open-superagent skill defines the protocols.\n'
+      + JSON.stringify({ actions, note: 'A retry:true action was handed out before and its lease lapsed: verify the domain before repeating a non-idempotent step.' }, null, 2)
   }))
+
+  server.registerTool('superagent_tick_ack', {
+    title: 'open-superagent tick ack',
+    description: 'Retire the tick actions you finished, by actionId, so they are never handed out again. Call it after the'
+      + ' protocols of one tick are complete; an action you drop without acting stays leased until its lease lapses and'
+      + ' comes back marked retry.',
+    inputSchema: {
+      actionIds: z.array(z.string().min(1)).min(1).describe('The actionId values of the actions this turn completed.'),
+    },
+  }, args => textResult(() => JSON.stringify({ retired: runtime.actions.ack(args.actionIds) }, null, 2)))
 
   server.registerTool('superagent_settings_get', {
     title: 'open-superagent settings get',
@@ -207,12 +234,19 @@ export function registerTools(server: McpServer, runtime: Runtime): void {
   server.registerTool('superagent_settings_save', {
     title: 'open-superagent settings save',
     description: 'Save one settings block (policy, eval, executor, source:manual, or pause) as the next revision, and'
-      + ' tell the Engine how the change bears on open tickets.',
-    inputSchema: { block: z.string(), value: z.unknown() },
+      + ' tell the Engine how the change bears on open tickets. Block values merge over the current block, so a policy'
+      + ' save that sets sources keeps the configured rules. Pass the revision you read from superagent_settings_get to'
+      + ' refuse a save someone else made first.',
+    inputSchema: {
+      block: z.string(),
+      value: z.unknown(),
+      revision: z.number().int().nonnegative().optional()
+        .describe('The block revision the caller read; a mismatch is refused instead of overwriting a concurrent save.'),
+    },
   }, args => textResult(() => {
     const block = SETTINGS_BLOCKS.find(item => item === args.block)
     if (!block) throw new UserError('unknownBlock', { block: args.block })
-    const saved = runtime.settings.save(block, args.value, 'tool')
+    const saved = runtime.settings.save(block, args.value, 'tool', args.revision)
     return JSON.stringify({ revision: saved.revision, policyVersion: saved.policyVersion, policyChanged: saved.policyChanged }, null, 2)
   }))
 
@@ -280,6 +314,8 @@ export function registerTools(server: McpServer, runtime: Runtime): void {
       + ' one matched rule. Observe mode records what would be accepted without creating a ticket.',
     inputSchema: EvalDecideSchema,
   }, (args: EvalDecideInput) => textResult(() => {
+    // Only an accept needs the ticket fields; an ignore records its reason alone.
+    if (args.decision === 'accept' && (!args.title?.trim() || !args.scope?.trim())) throw new UserError('assessmentInvalid', { reason: 'An accept requires title and scope' })
     // The strength rides with the candidate; a candidate that is already gone (decided, expired) still allows routing
     // the trigger by hand, which the Engine judges from the gate alone.
     const candidate = runtime.engine.candidate(args.triggerId)
@@ -287,8 +323,8 @@ export function registerTools(server: McpServer, runtime: Runtime): void {
       decision: args.decision,
       rule_assessments: args.rule_assessments,
       direction: args.direction,
-      title: args.title,
-      scope: args.scope,
+      title: args.title?.trim() ?? '',
+      scope: args.scope?.trim() ?? '',
       reason: args.reason,
       ...(args.intent_evidence !== undefined ? { intent_evidence: args.intent_evidence } : {}),
       ...(args.acknowledgement !== undefined ? { acknowledgement: args.acknowledgement } : {}),
@@ -362,7 +398,86 @@ export function registerTools(server: McpServer, runtime: Runtime): void {
     return JSON.stringify({ ticketId: ticket.id, updatedAt: ticket.updatedAt }, null, 2)
   }))
 
-  // Batch 3: the worker protocol its subagents run tickets through.
+  // Batch 3: the operator's controls over tickets, threads, decisions, and stored triggers. These map one-to-one onto
+  // Engine methods upstream exposed through its management panel; a ZCode install has no panel, so they are tools.
+
+  server.registerTool('superagent_ticket_retry', {
+    title: 'open-superagent ticket retry',
+    description: 'Start a new assignment for a ticket whose worker reported blocked or failed (or whose input delivery'
+      + ' failed), under the same mandate. Use it after the person acted on the blocker.',
+    inputSchema: { ticketId: z.string().min(1) },
+  }, args => textResult(() => {
+    const before = runtime.store.tickets.get(args.ticketId)
+    if (!before) throw new UserError('unknownTicket')
+    if (!canRetry(before)) throw new UserError('notRetryable')
+    const ticket = runtime.engine.retryTicket(args.ticketId)
+    return JSON.stringify({ ticketId: ticket.id, stage: stageLabel(ticketStage(ticket)), assignment: latestAssignment(ticket)?.state }, null, 2)
+  }))
+
+  server.registerTool('superagent_ticket_stop', {
+    title: 'open-superagent ticket stop',
+    description: 'Stop a ticket on an explicit human instruction: it ends, its mandate is withdrawn, and it receives'
+      + ' nothing more. A worker-reported blocker is not a reason to stop.',
+    inputSchema: { ticketId: z.string().min(1), reason: z.string().optional().describe('Why, in one sentence.') },
+  }, args => textResult(() => {
+    const ticket = runtime.engine.stopTicket(args.ticketId, args.reason)
+    return JSON.stringify({ ticketId: ticket.id, ended: ticket.ended?.outcome ?? 'stopped' }, null, 2)
+  }))
+
+  server.registerTool('superagent_ticket_status', {
+    title: 'open-superagent ticket status',
+    description: 'Read one ticket\'s stage, latest report, assignment state, attention question, and working directory,'
+      + ' without the full input record. Ask a waiting worker for a status report with requestStatus.',
+    inputSchema: {
+      ticketId: z.string().min(1),
+      requestStatus: z.boolean().optional().describe('Also ask the worker for a status report; only a worker that reported waiting is asked.'),
+    },
+  }, args => textResult(() => {
+    const ticket = runtime.store.tickets.get(args.ticketId)
+    if (!ticket) throw new UserError('unknownTicket')
+    const asked = args.requestStatus ? runtime.engine.requestStatus(args.ticketId) : undefined
+    const assignment = latestAssignment(ticket)
+    return JSON.stringify({
+      ...ticketSummary(ticket),
+      open: !ticket.ended,
+      ended: ticket.ended,
+      attention: ticket.attention,
+      directory: ticket.execution?.directory,
+      prepared: !!ticket.execution?.preparedAt,
+      // The current assignment, so an orchestrator judging a re-handed spawn can tell whether a worker already claimed it
+      // (claimedAt) or never started (no claim, no report).
+      assignment: assignment ? { id: assignment.id, state: assignment.state, createdAt: assignment.createdAt,
+        startedAt: assignment.startedAt, claimedAt: assignment.claimedAt, report: assignment.report } : undefined,
+      threads: [...new Set([...(ticket.follows ?? []).map(follow => follow.thread), ...ticket.origin.triggerIds.flatMap(id => runtime.store.triggers.get(id)?.threads ?? []).map(threadKey)])],
+      ...(asked !== undefined ? { statusRequested: asked } : {}),
+    }, null, 2)
+  }))
+
+  server.registerTool('superagent_thread_unsubscribe', {
+    title: 'open-superagent thread unsubscribe',
+    description: 'Drop every ticket\'s subscription to one thread, such as a noisy issue, until a new decision'
+      + ' subscribes a ticket to it again. Open tickets keep working; they stop receiving that thread\'s messages.',
+    inputSchema: { thread: z.string().min(1).describe('The thread key, such as manual:conversation-1.') },
+  }, args => textResult(() => JSON.stringify({ thread: args.thread, removed: runtime.engine.unsubscribe(args.thread) }, null, 2)))
+
+  server.registerTool('superagent_decision_dismiss', {
+    title: 'open-superagent decision dismiss',
+    description: 'Dismiss the problem an unavailable decision shows, so the overview lists it no more. Only an'
+      + ' unavailable decision can be dismissed; a failed assessment\'s trigger stays stored and can be requeued.',
+    inputSchema: { decisionId: z.string().min(1) },
+  }, args => textResult(() => {
+    const decision = runtime.engine.dismiss(args.decisionId)
+    return JSON.stringify({ decisionId: decision.id, kind: decision.kind }, null, 2)
+  }))
+
+  server.registerTool('superagent_trigger_requeue', {
+    title: 'open-superagent trigger requeue',
+    description: 'Queue a stored trigger for a fresh evaluation, such as after fixing an assessment failure. Refused'
+      + ' while a worker on one of its threads still decides it.',
+    inputSchema: { triggerId: z.string().min(1) },
+  }, args => textResult(() => JSON.stringify({ triggerId: args.triggerId, queued: runtime.engine.reevaluate(args.triggerId) }, null, 2)))
+
+  // Batch 4: the worker protocol its subagents run tickets through.
 
   server.registerTool('superagent_worker_read', {
     title: 'open-superagent worker read',
@@ -373,6 +488,10 @@ export function registerTools(server: McpServer, runtime: Runtime): void {
   }, args => textResult(() => {
     const ticket = runtime.store.tickets.get(args.ticketId)
     if (!ticket) throw new UserError('unknownTicket')
+    // A worker reading its record is the first real evidence that a worker exists for this assignment; the Executor's
+    // restart reconciliation uses it to tell "still running" from "never started".
+    const assignment = latestAssignment(ticket)
+    if (assignment && assignment.state === 'running' && !assignment.claimedAt) runtime.engine.assignmentClaimed(ticket.id, assignment.id)
     return JSON.stringify(ticketView(ticket, triggerId => runtime.store.triggers.get(triggerId)), null, 2)
   }))
 
@@ -413,6 +532,10 @@ export function registerTools(server: McpServer, runtime: Runtime): void {
       ...(args.answers !== undefined ? { answers: args.answers } : {}),
     }
     const ticket = runtime.engine.report(args.ticketId, report)
+    // A one-shot worker's report ends its run, so the assignment's turn is over: record the boundary the Engine uses to
+    // decide which human messages a worker had a chance to read before the ticket ends.
+    const assignment = latestAssignment(ticket)
+    if (assignment && assignment.state === 'running') runtime.engine.turnEnded(args.ticketId, assignment.id)
     // Upstream notice semantics: a question and a terminal state reach the orchestrator; progress, waiting, and dropped stay internal.
     const question = typeof report.question === 'string' ? report.question : undefined
     const text = question !== undefined

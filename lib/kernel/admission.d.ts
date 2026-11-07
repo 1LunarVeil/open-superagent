@@ -1,0 +1,17 @@
+/**
+ * Per-scope admission matrix classifying incoming messages as explicit requests, inferred candidates, or ignored.
+ * A listed sender who addresses the agent always makes an explicit request (no table cell); an unaddressed message cannot be explicit.
+ */
+import type { AdmissionCell } from './model.ts';
+export type { AdmissionCell };
+export type Admission = 'explicit' | 'inferred' | 'ignore';
+export declare const ADMISSION_OPTIONS: {
+    readonly listedUnaddressed: readonly ["inferred", "ignore"];
+    readonly unlistedAddressed: readonly ["explicit", "inferred", "ignore"];
+    readonly unlistedUnaddressed: readonly ["inferred", "ignore"];
+};
+export type AdmissionRow = {
+    [C in AdmissionCell]?: typeof ADMISSION_OPTIONS[C][number];
+};
+/** Default admission rules (matching pre-table behavior): unaddressed messages from listed senders are inferred candidates; unlisted senders are ignored. */
+export declare const ADMISSION_DEFAULTS: Readonly<Record<AdmissionCell, Admission>>;

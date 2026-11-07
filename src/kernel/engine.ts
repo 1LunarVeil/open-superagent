@@ -169,6 +169,23 @@ export class Engine {
   // The Executor
 
   /**
+   * The Executor's fact that a ticket's workspace is ready, recorded on the ticket rather than inferred from assignment
+   * state so a retried ticket can prepare again after a failed attempt.
+   * @throws UserError when the ticket is unknown.
+   */
+  workspacePrepared(ticketId: string, at: string): void {
+    this.repo.atomic(() => { this.tickets.markPrepared(ticketId, at) })
+  }
+
+  /**
+   * The Executor's fact that a worker took the assignment up, which is the only evidence a worker is really running.
+   * @throws UserError when the ticket is unknown.
+   */
+  assignmentClaimed(ticketId: string, assignmentId: string): void {
+    this.repo.atomic(() => { this.assignments.claimed(ticketId, assignmentId) })
+  }
+
+  /**
    * The Executor's fact that an Assignment runs; the Inputs that wait for it go out.
    * @throws UserError when the ticket is unknown.
    */
@@ -267,5 +284,5 @@ export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reeva
 /** What Settings tells the Engine. */
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
-export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
+export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'assignmentClaimed' | 'workspacePrepared' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
   | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'>

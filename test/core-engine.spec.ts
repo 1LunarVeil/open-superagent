@@ -730,6 +730,31 @@ describe('interrupted assignments', () => {
     h.engine.assignmentInterrupted(other, running.id)
     expect(h.repo.tickets.get(other)!.assignments.map(item => item.state)).toEqual(['ended', 'pending'])
   })
+  it('leaves a claimed assignment running, because a worker that read its ticket is alive', () => {
+    // The host cannot see the subagent, so a claim is the only evidence it exists. Restarting a claimed assignment would
+    // start a second worker in the same directory while the first is still editing it.
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const running = runningAssignment(h.repo.tickets.get(ticketId)!)!
+    h.engine.assignmentClaimed(ticketId, running.id)
+    vi.mocked(h.executor.start).mockClear()
+    h.engine.assignmentInterrupted(ticketId, running.id)
+    const ticket = h.repo.tickets.get(ticketId)!
+    expect(ticket.assignments).toHaveLength(1)
+    expect(ticket.assignments[0]!.state).toBe('running')
+    expect(ticket.assignments[0]!.claimedAt).toBeTruthy()
+    expect(h.executor.start).not.toHaveBeenCalled()
+  })
+  it('records the first claim only, so a second read does not move the timestamp', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const running = runningAssignment(h.repo.tickets.get(ticketId)!)!
+    h.engine.assignmentClaimed(ticketId, running.id)
+    const first = h.repo.tickets.get(ticketId)!.assignments[0]!.claimedAt
+    h.tick(5)
+    h.engine.assignmentClaimed(ticketId, running.id)
+    expect(h.repo.tickets.get(ticketId)!.assignments[0]!.claimedAt).toBe(first)
+  })
 })
 describe('pause', () => {
   it('lets no Eval expire while processing is paused, and moves its deadline on by the pause\'s length', () => {

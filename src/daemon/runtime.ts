@@ -11,7 +11,8 @@ import { join } from 'node:path'
 import { lock } from 'proper-lockfile'
 import { Engine } from '../kernel/index.ts'
 import type { ScopeResult, SourceScope } from '../kernel/index.ts'
-import { settingsPolicy } from '../kernel/policy.ts'
+import { policyVersion, SettingsSchema, settingsPolicy } from '../kernel/policy.ts'
+import type { AssessmentOutcome, Ticket } from '../kernel/index.ts'
 import { Actions } from './actions.ts'
 import { MasterAssessor } from './assessor.ts'
 import { ZcodeExecutor } from './executor.ts'
@@ -25,31 +26,43 @@ import { Settings } from '../persist/settings.ts'
 import { Store } from '../persist/store.ts'
 
 /** Options for `Runtime.open`. */
-export interface RuntimeOptions { stateDir: string }
+export interface RuntimeOptions {
+  stateDir: string
+  /** The project repository tickets are cut from; a host sets it to its workspace root. */
+  projectDir?: string
+  /** Receives one-line diagnostics; defaults to stderr. */
+  log?: (message: string) => void
+}
 
 /** The state directory is held by another daemon instance; the entry point exits with code 3. */
 export class StateLocked extends Error {
-  constructor() { super('open-superagent state directory is locked by another daemon instance') }
+  constructor() {
+    super('open-superagent state directory is locked by another daemon instance')
+  }
 }
 
 /** Parts built by `open` before the Runtime exists, assigned as readonly fields in its constructor. */
 interface StorageParts {
   stateDir: string
+  projectDir?: string
   store: Store
   board: HealthBoard
   effects: Effects
   actions: Actions
   release: () => Promise<void>
+  log: (message: string) => void
 }
 
 export class Runtime {
   readonly stateDir: string
+  readonly projectDir?: string
   readonly store: Store
   readonly effects: Effects
   readonly actions: Actions
   private readonly board: HealthBoard
   private readonly releaseLock?: () => Promise<void>
   private readonly stopped = new AbortController()
+  private readonly log: (message: string) => void
   private stoppingFlag = false
   private stopPromise?: Promise<void>
   /** Built by `initialize`, which runs before any Engine command or MCP tool can run. */
@@ -62,11 +75,13 @@ export class Runtime {
 
   private constructor(parts: StorageParts) {
     this.stateDir = parts.stateDir
+    this.projectDir = parts.projectDir
     this.store = parts.store
     this.board = parts.board
     this.effects = parts.effects
     this.actions = parts.actions
     this.releaseLock = parts.release
+    this.log = parts.log
   }
 
   /**
@@ -76,7 +91,8 @@ export class Runtime {
    * @throws StateLocked when another daemon instance holds the state directory.
    */
   static async open(options: RuntimeOptions): Promise<Runtime> {
-    const { stateDir } = options
+    const { stateDir, projectDir } = options
+    const log = options.log ?? ((message: string) => { process.stderr.write('open-superagent: ' + message + '\n') })
     mkdirSync(stateDir, { recursive: true, mode: 0o700 })
     let release: (() => Promise<void>) | undefined
     try {
@@ -85,13 +101,11 @@ export class Runtime {
       throw new StateLocked()
     }
     try {
-      const store = new Store(join(stateDir, 'open-superagent.sqlite'), error => {
-        process.stderr.write('open-superagent: ' + String(error) + '\n')
-      })
+      const store = new Store(join(stateDir, 'open-superagent.sqlite'), error => log(String(error)))
       const board = new HealthBoard()
       const effects = new Effects(store, board)
       const actions = new Actions(store)
-      return new Runtime({ stateDir, store, board, effects, actions, release })
+      return new Runtime({ stateDir, projectDir, store, board, effects, actions, release, log })
     } catch (error) {
       // Release the lock so a later attempt in another process can take it.
       await release().catch(() => {})
@@ -119,6 +133,9 @@ export class Runtime {
       assessor,
       executor,
       outbox,
+      // The Executor owns the ticket's physical workspace, so it fills `execution` before the Engine saves the ticket.
+      prepareTicket: (ticket, outcome) => this.prepareTicket(ticket, outcome),
+      emit: event => this.onEvent(event),
     })
     const settings = this.settings = new Settings(this.store, engine, () => scope)
     assessor.install({
@@ -136,6 +153,11 @@ export class Runtime {
       slots: () => settings.get().executor.maxWorkers,
       paused: () => settings.get().paused,
       workRoot: () => settings.get().executor.directory || join(this.stateDir, 'work'),
+      projectDir: () => this.projectDir,
+      worktree: () => settings.get().executor.worktree,
+      prepareTimeoutMs: () => settings.get().executor.prepareTimeoutSeconds * 1000,
+      baseRef: () => 'HEAD',
+      log: this.log,
     })
     this.passesRef = new Passes({
       engine,
@@ -148,6 +170,33 @@ export class Runtime {
     // Effects dispatch only between start and drain, so rows queued by an earlier run wait until now; passes themselves
     // start later, once the MCP server is connected (the entry point calls `passes.start()`).
     this.effects.start()
+    // A lease in the database belongs to a session that no longer exists (one daemon owns a state directory), so release
+    // them all: otherwise the first tick in the new session answers "No pending actions" while work waits out the lease.
+    const released = this.actions.releaseAllLeases()
+    if (released) this.log('Released ' + String(released) + ' lease(s) held by a previous session')
+    this.seedLocalOperator()
+    // The domain may say a worker is running while no worker ever received it (the host restarted, or the session died
+    // between the tick and the spawn). Reconcile once, before new work can be dispatched.
+    executor.reconcile()
+    this.actions.prune()
+  }
+
+  /**
+   * Seeds the local operator into the manual Source's allowlist on first run. Without it the person at the keyboard is an
+   * unlisted sender, so their explicit requests are gate-ignored and the plugin appears inert. The guard is "the policy
+   * block was never saved", not "no settings were ever saved": pausing or changing the executor first must not block the
+   * seed, and a policy the operator later edits is never overwritten.
+   */
+  private seedLocalOperator(): void {
+    const settings = this.store.settings()
+    if (this.store.blockRevision('policy') > 0) return
+    const manual = settings.policy.sources.manual
+    if (manual?.allowed?.length) return
+    const seeded = SettingsSchema.parse({
+      ...settings,
+      policy: { ...settings.policy, sources: { ...settings.policy.sources, manual: { ...manual, allowed: [{ id: 'operator', name: 'Operator' }] } } },
+    })
+    this.store.saveSettings(seeded, { source: 'internal', block: 'policy', policyVersion: policyVersion(seeded), policyChanged: true, notified: [] })
   }
 
   /** The orchestration passes; the daemon starts them once the MCP server is connected. */
@@ -181,6 +230,30 @@ export class Runtime {
   private settingsRef(): Settings | undefined { return this.settings }
 
   /**
+   * Fills a new ticket's `execution` from the Executor settings, so the launch handler and the worker prompt share one
+   * decision about the directory and short name. Upstream did the same in `DshExecutor.prepare`.
+   */
+  private prepareTicket(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Ticket {
+    const settings = this.settingsRef()?.get() ?? this.store.settings()
+    const root = settings.executor.directory || join(this.stateDir, 'work')
+    const name = outcome.name?.trim() || ticket.id.slice(0, 12)
+    return { ...ticket, execution: { name, directory: join(root, ticket.id.slice(0, 12)), assignment: ticket.title } }
+  }
+
+  /** Turns domain events into orchestrator notices for the few facts a person must see before the next tick. */
+  private onEvent(event: { type: string; data?: Record<string, unknown> }): void {
+    // `decision.recorded` carries `{decisionId, kind, threadKey}` in `data`. An unavailable assessment is the one a person
+    // must hear about: the trigger is stored and can be requeued, but nothing else will surface the failure.
+    if (event.type !== 'decision.recorded') return
+    if (event.data?.kind !== 'unavailable') return
+    this.store.atomic(() => this.actions.add({
+      kind: 'notice',
+      summary: 'An evaluation could not be assessed and became unavailable; the trigger is stored and can be requeued.',
+      value: { event: event.type, ...event.data },
+    }, new Date().toISOString()))
+  }
+
+  /**
    * The v1 manual Source scope: every trigger is listened to and observed, and the receiving scope row is the
    * conversation key from the trigger's `meta.threadId` (or the default row when a Source sends none).
    */
@@ -190,7 +263,9 @@ export class Runtime {
 
   /**
    * The manual ReplySenders for the Outbox: v1 has no channel adapters, so `instance` knows only the manual Source, every
-   * channel is allowed, and a send is recorded as a `reply_recorded` action the orchestrator acts on from its tick.
+   * channel is allowed, and a send is recorded as a `reply_recorded` action the orchestrator acts on from its tick. The
+   * manual channel is the session's own conversation, so the orchestrator delivers that text verbatim rather than
+   * paraphrasing it.
    */
   private manualSenders(): ReplySenders {
     return {

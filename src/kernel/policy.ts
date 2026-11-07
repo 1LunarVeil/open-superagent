@@ -96,6 +96,14 @@ export const ExecutorConfigSchema = z.object({
   // Windows adaptation: an absolute POSIX path or a Windows drive path, or empty for <stateDir>/work.
   directory: z.string().trim().refine(path => path === '' || path.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(path), 'An absolute path, or empty for <stateDir>/work').default(''),
   prepare: z.string().max(LIMITS.prepareCommand).default(''),
+  /**
+   * When no `prepare` command is configured, create the ticket directory as a detached git worktree of the project
+   * repository. Upstream left this to `prepare`; a plugin install has no place to put that command, so the default is
+   * a usable checkout. Set false to start workers in an empty directory instead.
+   */
+  worktree: z.boolean().default(true),
+  /** How long the `prepare` command (or the default worktree creation) may run before the ticket fails. */
+  prepareTimeoutSeconds: z.number().int().min(1).max(3600).default(600),
   blockedCommands: z.array(CommandNameSchema).default([]),
 }).strict()
 export const SourceInstanceSchema = z.object({ enabled: z.boolean().default(true), config: z.record(z.string(), z.unknown()).default({}) }).strict()

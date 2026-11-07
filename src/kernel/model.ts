@@ -223,6 +223,13 @@ export interface Assignment {
   endedAt?: string
   endedReason?: string
   report?: { state: ReportState; summary: string; at: string }
+  /**
+   * When a worker first read this assignment's ticket record. It is the only reliable evidence that a worker actually
+   * started: `startedAt` only means the Executor queued the work, so a host that died between queueing and spawning
+   * leaves a running assignment nobody ever claimed. A claimed assignment is never restarted as "interrupted", and a
+   * re-handed `spawn_worker` is acknowledged instead of spawning a second worker.
+   */
+  claimedAt?: string
   /** When Inputs last reached the worker; one at or after `report.at` means the worker has been busy with Inputs since that report. */
   deliveredAt?: string
   /**
@@ -312,7 +319,7 @@ export interface Ticket {
  * Thread closed; the ticket then ends unless its work has not finished (see `Tickets.unfinished`).
  */
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
-export interface Execution { name: string; directory: string; assignment: string }
+export interface Execution { name: string; directory: string; assignment: string; /** When the workspace was successfully prepared; absent until then. */ preparedAt?: string }
 
 /** Whether a ticket is open: it has not ended. */
 export const liveTicket = (ticket: Pick<Ticket, 'ended'>): boolean => !ticket.ended

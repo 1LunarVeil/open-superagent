@@ -9,8 +9,14 @@
   "hooks": "./hooks/hooks.json",
   "mcpServers": {
     "open-superagent": {
+      "type": "stdio",
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/lib/daemon/index.js"]
+      "args": ["${ZCODE_PLUGIN_ROOT}/lib/daemon/index.js"],
+      "cwd": "${ZCODE_PROJECT_DIR}",
+      "env": {
+        "OPEN_SUPERAGENT_PROJECT_DIR": "${ZCODE_PROJECT_DIR}"
+      },
+      "timeoutMs": 60000
     }
   }
 }

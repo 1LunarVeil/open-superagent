@@ -13,12 +13,13 @@ import type { Effects } from '../persist/effects.ts'
 import type { Assignment, EngineForExecutor, Executor, Ticket, Trigger } from '../kernel/index.ts'
 import type { Store } from '../persist/store.ts'
 import type { Actions } from './actions.ts'
+import { PrepareFailed, prepareWorkspace } from './sandbox.ts'
 
 /** Host dependencies the executor needs, narrowed to what it uses. */
 export interface ExecutorDeps {
-  readonly effects: Pick<Effects, 'enqueue' | 'handle'>
+  readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'pending'>
   readonly actions: Actions
-  readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead'>
+  readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'assignmentClaimed' | 'workspacePrepared' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'report' | 'assignmentInterrupted'>
   readonly store: Store
   /** How many tickets may have a running worker at once; a launch beyond it waits (`Later`). */
   slots(): number
@@ -26,6 +27,16 @@ export interface ExecutorDeps {
   paused(): boolean
   /** Root of the per-ticket working directories, such as `<stateDir>/work`. */
   workRoot(): string
+  /** The project repository tickets are cut from, or undefined when the host supplied none. */
+  projectDir(): string | undefined
+  /** Whether a ticket directory becomes a detached git worktree. */
+  worktree(): boolean
+  /** How long workspace preparation may run, in milliseconds. */
+  prepareTimeoutMs(): number
+  /** The base ref a worktree starts from. */
+  baseRef(): string
+  /** Receives a one-line diagnostic, such as a workspace note or a recovery decision. */
+  log(message: string): void
 }
 
 /**
@@ -92,6 +103,27 @@ export function buildAssignmentPrompt(ticket: Ticket, trigger: (triggerId: strin
 }
 
 /**
+ * Builds the prompt for a worker that continues an existing ticket: the ticket id, the working directory, the inputs that
+ * just arrived, and the protocol. A continuation worker has no assignment card, so without this it would not even know
+ * which ticket to read.
+ */
+export function buildContinuationPrompt(ticket: Ticket, directory: string, inputs: Record<string, unknown>[]): string {
+  return [
+    'You are the worker subagent continuing one open-superagent ticket. Work only inside the working directory below, and'
+      + ' only within the mandate the ticket record carries.',
+    '',
+    JSON.stringify({ ticketId: ticket.id, title: ticket.title, directory, newInputs: inputs }, null, 2),
+    '',
+    'PROTOCOL',
+    '- Read the full ticket record first with superagent_worker_read and the ticketId above; it carries the mandate, every'
+      + ' earlier input, and any open question.',
+    '- New messages that reached this ticket are listed above. Work what belongs to the ticket; hand back with'
+      + ' superagent_worker_handback what does not.',
+    '- Report with superagent_worker_report using the same ticketId. Your report ends this round: after it returns, stop.',
+  ].join('\n')
+}
+
+/**
  * Queues launches and input deliveries as orchestrator actions and reports their outcome back to the Engine.
  * The deps arrive through `install` rather than the constructor because the Engine is built with the executor in hand
  * (two-phase wiring breaks the Engine-executor cycle), so the effect handlers can only register afterwards.
@@ -102,7 +134,7 @@ export class ZcodeExecutor implements Executor {
   install(deps: ExecutorDeps): void {
     if (this.deps) throw new Error('The executor is already installed')
     this.deps = deps
-    deps.effects.handle('launch', async ({ ticketId, assignmentId }) => { this.launch(ticketId, assignmentId) },
+    deps.effects.handle('launch', async ({ ticketId, assignmentId }) => { await this.launch(ticketId, assignmentId) },
       { limit: () => deps.paused() ? 0 : deps.slots(), retry: [5000, 60_000] })
     deps.effects.handle('delivery', async ({ ticketId, assignmentId }) => { this.deliverWaiting(ticketId, assignmentId) },
       { limit: () => deps.paused() ? 0 : 4, retry: [5000, 60_000] })
@@ -126,27 +158,87 @@ export class ZcodeExecutor implements Executor {
     this.requireDeps().actions.cancelForTicket(ticket.id)
   }
 
+  /**
+   * Reconciles the domain with what actually reached the orchestrator after a restart. A host has no live worker session to
+   * inspect, so the durable action queue is the only evidence: an assignment marked `running` with no undelivered
+   * `spawn_worker`/`deliver_inputs` action never reached a worker and must be resumed or restarted by the Engine, and a
+   * pending assignment with no queued launch is queued again. Runs once at startup, after effects begin dispatching.
+   */
+  reconcile(): void {
+    const deps = this.requireDeps()
+    for (const ticket of deps.store.tickets.active()) {
+      if (ticket.ended) continue
+      const latest = ticket.assignments.at(-1)
+      if (!latest) continue
+      // An assignment with a failed report already told the person; restarting it would repeat a failure the environment
+      // has not fixed. Only an explicit retry moves such a ticket on.
+      if (latest.report?.state === 'failed' && latest.state === 'pending') continue
+      const queued = deps.actions.pending().some(action => action.kind === 'spawn_worker' && action.assignmentId === latest.id)
+      if (latest.state === 'running' && !queued) {
+        deps.log('Reconciling ticket ' + ticket.id + ': its running assignment has no queued worker')
+        deps.engine.assignmentInterrupted(ticket.id, latest.id)
+      } else if (latest.state === 'pending' && !deps.effects.pending('launch', latest.id) && !queued) {
+        deps.log('Reconciling ticket ' + ticket.id + ': queueing its pending launch again')
+        deps.effects.enqueue('launch', latest.id, { ticketId: ticket.id, assignmentId: latest.id })
+      }
+    }
+  }
+
   private requireDeps(): ExecutorDeps {
     if (!this.deps) throw new Error('The executor is not installed; the runtime wires it before any ticket is created')
     return this.deps
   }
 
-  /** Turns a queued launch into a `spawn_worker` action and tells the Engine the assignment runs, in one transaction. */
-  private launch(ticketId: string, assignmentId: string): void {
+  /** Prepares the workspace and turns a queued launch into a `spawn_worker` action, all after the Engine committed. */
+  private async launch(ticketId: string, assignmentId: string): Promise<void> {
     const deps = this.requireDeps()
     const ticket = deps.store.tickets.get(ticketId)
     const assignment = ticket?.assignments.find(item => item.id === assignmentId)
     // The ticket or the assignment ended while the launch waited: the Engine has spoken, and a retry cannot revive it.
     if (!ticket || !assignment || ticket.ended || assignment.state === 'ended') return
-    if (assignment.state === 'running') return // the Engine already knows this assignment runs
     // Concurrency gate over the Engine's own working set, so a restart re-derives it instead of keeping local counters.
     const busy = deps.store.tickets.active().filter(item => !item.ended && item.assignments.some(running => running.state === 'running')).length
-    if (busy >= deps.slots()) throw new Later('All worker slots are busy')
-    const directory = join(deps.workRoot(), ticketId.slice(0, 12))
-    mkdirSync(directory, { recursive: true })
-    const prompt = buildAssignmentPrompt(ticket, id => deps.store.triggers.get(id))
+    if (assignment.state !== 'running' && busy >= deps.slots()) throw new Later('All worker slots are busy')
+    const directory = ticket.execution?.directory ?? join(deps.workRoot(), ticketId.slice(0, 12))
+    // Preparation is a fact recorded on the ticket, not an inference from assignment state: a retried ticket whose first
+    // preparation failed must be able to prepare again once the person fixed the environment.
+    if (!ticket.execution?.preparedAt) {
+      try {
+        mkdirSync(deps.workRoot(), { recursive: true })
+        const notes = await prepareWorkspace({
+          directory,
+          workRoot: deps.workRoot(),
+          worktree: deps.worktree(),
+          projectDir: deps.projectDir(),
+          ref: deps.baseRef(),
+          timeoutMs: deps.prepareTimeoutMs(),
+        })
+        for (const note of notes) deps.log('Ticket ' + ticketId + ': ' + note)
+        deps.engine.workspacePrepared(ticketId, new Date().toISOString())
+      } catch (error) {
+        // A workspace that cannot be prepared is not retried automatically: the person must fix the environment and retry.
+        const message = error instanceof PrepareFailed ? error.message : String(error)
+        deps.log('Ticket ' + ticketId + ': workspace preparation failed: ' + message)
+        deps.engine.report(ticketId, { state: 'failed', summary: 'Workspace preparation failed: ' + message.slice(0, 600) })
+        // A launch failure is otherwise invisible to the orchestrator, which would only see a ticket that never progresses.
+        deps.store.atomic(() => deps.actions.add({
+          kind: 'relay', ticketId, text: 'Worker launch failed for ' + ticketId + ': ' + message.slice(0, 300),
+        }, new Date().toISOString()))
+        return
+      }
+    }
+    // Re-read after the await: a stop or thread close during a slow worktree creation ends the assignment, and queueing a
+    // spawn for it would tell the orchestrator to start work that no longer exists.
+    const current = deps.store.tickets.get(ticketId)
+    const live = current?.assignments.find(item => item.id === assignmentId)
+    if (!current || current.ended || !live || live.state === 'ended') {
+      deps.actions.cancelForTicket(ticketId)
+      return
+    }
+    if (live.state === 'running') return // a delivery or an earlier attempt already told the Engine this runs
+    const prompt = buildAssignmentPrompt(current, id => deps.store.triggers.get(id))
     deps.store.atomic(() => {
-      deps.actions.add({ kind: 'spawn_worker', ticketId, assignmentId, title: ticket.execution?.name ?? ticket.title, prompt, directory },
+      deps.actions.add({ kind: 'spawn_worker', ticketId, assignmentId, title: current.execution?.name ?? current.title, prompt, directory },
         new Date().toISOString())
       deps.engine.assignmentStarted(ticketId, assignmentId)
     })
@@ -160,9 +252,13 @@ export class ZcodeExecutor implements Executor {
     if (!ticket || !assignment || assignment.state !== 'running') return
     if (!ticket.undelivered.length) return
     const inputIds = [...ticket.undelivered]
-    const text = JSON.stringify(inputIds.map(id => renderInput(ticket, id, id2 => deps.store.triggers.get(id2))))
+    const rendered = inputIds.map(id => renderInput(ticket, id, id2 => deps.store.triggers.get(id2)))
+    const directory = ticket.execution?.directory ?? join(deps.workRoot(), ticketId.slice(0, 12))
+    // The action carries the ticket id and directory as well as the inputs: a one-shot continuation worker has no
+    // assignment card, so the prompt must be able to name the ticket it continues and where it works.
+    const text = buildContinuationPrompt(ticket, directory, rendered)
     deps.store.atomic(() => {
-      deps.actions.add({ kind: 'deliver_inputs', ticketId, assignmentId, inputIds, text }, new Date().toISOString())
+      deps.actions.add({ kind: 'deliver_inputs', ticketId, assignmentId, inputIds, text, directory }, new Date().toISOString())
       deps.engine.inputsDelivered(ticketId, assignmentId, inputIds)
       // R2 port decision: deliver implies read. Upstream records `readAt` when the worker's Session takes a message into
       // a step; a ZCode subagent has no step events to reconcile against, and the action queue is the delivery channel,

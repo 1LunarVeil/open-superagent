@@ -9,7 +9,8 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run test && npm run build"
+    "check:agents": "node scripts/check-agent-tools.mjs",
+    "check": "npm run typecheck && npm run test && npm run build && npm run check:agents"
   },
   "engines": {
     "node": ">=22.5"

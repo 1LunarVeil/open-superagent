@@ -1,6 +1,8 @@
 node_modules/
-lib/
 *.log
 state/
 .mimosa/
 .smoke-state/
+.smoke-state.lock/
+.agent-tools-check/
+.agent-tools-check.lock/

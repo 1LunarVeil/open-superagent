@@ -25,7 +25,12 @@ export class Passes {
   private pumping?: Promise<void>
   private pumpAgain?: Promise<void>
   constructor(private readonly host: PassesHost) {}
-  start(): void { if (!this.stopped) this.timer = setInterval(() => { this.request() }, 2000) }
+  /** Starts the periodic pump and runs one pass at once, so a fresh daemon reports `ready` instead of `starting`. */
+  start(): void {
+    if (this.stopped) return
+    this.timer = setInterval(() => { this.request() }, 2000)
+    this.request()
+  }
   stop(): Promise<unknown> {
     this.stopped = true
     clearInterval(this.timer)
@@ -37,10 +42,16 @@ export class Passes {
     if (result === 'stored') this.request()
     return result
   }
+  /**
+   * Runs a pass and reports the runtime's health: the first successful pass turns `starting` into `ready`, and every later
+   * failure turns it into `error` until a pass succeeds again.
+   */
   request(): void {
     const { health } = this.host
     this.pump().then(() => {
-      if (health.get()?.state !== 'error' || this.host.lifetime.aborted) return
+      if (this.host.lifetime.aborted) return
+      const current = health.get()
+      if (current?.state === 'ready') return
       health.set({ state: 'ready', detail: 'open-superagent is ready', at: now() })
     }, (error: unknown) => { health.set({ state: 'error', detail: `A pass failed: ${String(error)}`, at: now() }) })
   }
