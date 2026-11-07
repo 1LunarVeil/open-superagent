@@ -1,0 +1,28 @@
+{
+  "name": "open-superagent",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "description": "A proactive agent kernel for one repository, internalized from DeepSeek's dsh-superagent research prototype (MIT). Ships as a ZCode plugin: MCP daemon + orchestrator skill + worker subagent.",
+  "main": "lib/daemon/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run test && npm run build"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "proper-lockfile": "^4.1.2",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.9",
+    "@types/proper-lockfile": "^4.1.4",
+    "typescript": "6.0.3",
+    "vitest": "4.1.8"
+  }
+}

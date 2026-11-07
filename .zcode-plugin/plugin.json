@@ -1,0 +1,16 @@
+{
+  "name": "open-superagent",
+  "version": "0.1.1",
+  "description": "A proactive agent kernel for one repository, internalized from DeepSeek's dsh-superagent research prototype: an MCP daemon (stdio) hosts the transactional Engine, the main session assesses and routes requests through superagent_* tools, and each accepted ticket runs in an open-superagent:worker subagent.",
+  "author": { "name": "open-superagent contributors" },
+  "license": "MIT",
+  "skills": "./skills",
+  "agents": "./agents",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": {
+    "open-superagent": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/lib/daemon/index.js"]
+    }
+  }
+}
