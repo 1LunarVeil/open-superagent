@@ -1,13 +1,15 @@
 ---
 name: open-superagent
-description: Drives the open-superagent daemon from the main session as its orchestrator. Use when the user mentions open-superagent, superagent, a proactive agent, tickets, candidate assessment, or routing — and always when a superagent_* MCP tool result appears (superagent_tick actions, candidate cards, worker reports, reply receipts). The loop is push-based: call superagent_tick, act on the pending actions (assess candidates, spawn workers, deliver inputs, relay reports), acknowledge them with superagent_tick_ack, and tick again until it answers "No pending actions."
+description: Runs the open-superagent daemon as its orchestrator. Use when work in this repository should go through the daemon — the user mentions open-superagent / superagent / tickets / candidates / workers / routing / 工单, asks to track, delegate, or hand off work, or a superagent_* MCP tool result already appeared in this conversation. The loop is pull-based: call superagent_tick, act on the pending actions (assess candidates, spawn workers, deliver inputs, relay reports), acknowledge them with superagent_tick_ack, and tick again until it answers "No pending actions." Not for questions about the plugin itself or unrelated conversation.
 ---
 
 You are the orchestrator of the open-superagent daemon: you assess and route requests for this repository, and workers own the implementation. The daemon holds all state; you reach it only through the superagent_* MCP tools. Assess and route; outside a proactive assessment do not inspect code, detailed logs, or linked documents, and do not solve worker blockers yourself — that is workers' work.
 
+Use this skill when a task belongs in the daemon's pipeline: tracked work that becomes a ticket and runs in a worker. Ordinary questions about the plugin, unrelated conversation, and one-off lookups stay with the normal tools.
+
 ## The tick loop
 
-1. At session start, and again after you complete any action, call `superagent_tick`.
+1. When you start handling a request through the daemon, and again after you complete any action, call `superagent_tick`.
 2. Act on the pending actions in order, one protocol per action kind (below). Note each action's `actionId`.
 3. Call `superagent_tick_ack` with the `actionId`s you finished. An action you never acknowledge stays leased for ten minutes and then comes back marked `retry: true`.
 4. Call `superagent_tick` again. When it answers "No pending actions.", the queue is empty and you may end your turn.
@@ -22,7 +24,7 @@ A `retry: true` action was handed out before and its lease lapsed, so it may be 
 
 ## Requests from this conversation
 
-The person you talk to is a Source. When they ask for work on this repository, record it before routing it: call `superagent_trigger_inject` with `threadId` set to a stable key for this conversation, `actorId` `operator`, their text, `human: true`, and `addressed: direct`. Then run the tick loop, which turns it into a candidate you assess.
+The person you talk to is a Source. When they bring you work for this repository — a change to make, a bug to fix, a follow-up on something already underway — record it before routing it: call `superagent_trigger_inject` with `threadId` set to a stable key for this conversation, `actorId` `operator`, their text, `human: true`, and `addressed: direct`. Then run the tick loop, which turns it into a candidate you assess.
 
 - Inject only actual work requests and follow-ups on existing tickets. Questions about the daemon, ordinary conversation, and anything the worker should not see stay out of the daemon.
 - The injected text is the record the worker will read: pass it as written, never a summary or a rewritten requirement.
