@@ -13,7 +13,7 @@ import type { Effects } from '../persist/effects.ts'
 import type { Assignment, EngineForExecutor, Executor, Ticket, Trigger } from '../kernel/index.ts'
 import type { Store } from '../persist/store.ts'
 import type { Actions } from './actions.ts'
-import { PrepareFailed, prepareWorkspace } from './sandbox.ts'
+import { PrepareFailed, prepareWorkspace, releaseWorkspace } from './sandbox.ts'
 
 /** Host dependencies the executor needs, narrowed to what it uses. */
 export interface ExecutorDeps {
@@ -151,11 +151,20 @@ export class ZcodeExecutor implements Executor {
   }
 
   /**
-   * Retracts the ticket's undelivered actions; the Engine calls this after the ticket or assignment has already ended in
-   * the domain, and a ZCode host has no live worker session to cancel.
+   * Retracts the ticket's undelivered actions and releases its workspace. The Engine calls this after the ticket or
+   * assignment has already ended in the domain, and a ZCode host has no live worker session to cancel.
+   *
+   * `releaseWorkspace` only removes a worktree with no changes in it; one holding the worker's edits is left in place, which
+   * is what makes the change reviewable after the ticket ends. It runs outside the Engine transaction for the same reason
+   * the launch handlers do, and its failure never affects the domain.
    */
   stop(ticket: Ticket, assignment: Assignment, reason: string): void {
-    this.requireDeps().actions.cancelForTicket(ticket.id)
+    const deps = this.requireDeps()
+    deps.actions.cancelForTicket(ticket.id)
+    const directory = ticket.execution?.directory
+    if (directory) void releaseWorkspace(directory, deps.projectDir()).catch(error => {
+      deps.log('Ticket ' + ticket.id + ': releasing its workspace failed: ' + String(error))
+    })
   }
 
   /**

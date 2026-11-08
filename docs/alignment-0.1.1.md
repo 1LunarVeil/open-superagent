@@ -33,7 +33,7 @@
 | A19 | 面板/API 的 retry/stop/requeue/unsubscribe/dismiss/pause/settings | 对齐（本轮补齐）| 6 个新工具映射原 Engine 方法（`tools.ts` 第三批） |
 | A20 | 有界分页读取代替灌上下文 | 部分 | `superagent_read` / `superagent_eval_read` 有界；无 `offset/cursor` 分页 |
 | A21 | 跨重启幂等投递 | 对齐（本轮增强）| 动作队列改为**租约** + `superagent_tick_ack`，`actions.prune()` 控制增长 |
-| A22 | 单写者状态所有权 | 对齐 | `proper-lockfile` 锁定 stateDir；第二实例 exit 3 并输出可诊断信息 |
+| A22 | 单写者状态所有权 | 对齐 | `proper-lockfile` 作为**调度租约**：一个进程派发 effects/passes，其余进程共用同一 SQLite 并照常提供工具，leader 退出后自动接管 |
 
 ## 二、本轮修复的缺陷（此前版本的真实问题）
 
@@ -79,15 +79,16 @@
 5. **无面板**：上游的 HTTP + React 概览页未移植；本插件用 MCP 工具 + skill 承担同样的操作面。
 6. **无分页游标**：`superagent_read` 一次返回定长结果，超大线程可能被截断。
 7. **`prepare` 命令未移植**：上游允许操作员配置任意 shell 准备命令；本插件只跑固定的 `git worktree`，以避免任意命令执行面（这是有意的安全取舍，不是遗漏）。
-8. **跨会话共享**：同一项目同时开两个会话时，第二个 daemon 无法获得锁（exit 3）。这是单写者设计的必然结果，已在 stderr 明确提示。
+8. **跨会话共享**：同项目多个会话现在共用一份数据库、只有一个负责调度（这是修复后的行为）。但同一工单不能被两个会话并行推动，调度者切换有最多 5 秒接管延迟。
+9. **改动不自动合并**：worker 只改自己的分离工作树，主检出不被动，结果需人工应用。上游靠 PR 流程解决，本插件尚未接 GitHub。
 
 ## 五、验证证据
 
 | 检查 | 命令 | 结果 |
 |---|---|---|
 | 类型检查 | `npm run typecheck` | 通过 |
-| 单元 + 集成 | `npm test` | 185 通过（内核 146 + 持久层 13 + daemon 19 + e2e 7） |
+| 单元 + 集成 | `npm test` | 188 通过（内核 146 + 持久层 14 + daemon 20 + e2e 8） |
 | 构建 | `npm run build` | 通过，产出 `lib/` |
 | agent 工具名一致 | `npm run check:agents` | 25 工具 / 1 agent 文件，OK |
 | 冒烟 | `node scripts/smoke-stdio.mjs` | 25 工具、准入闸门、候选卡均符合预期 |
-| 真实宿主 | 桌面端重装后新会话 | **待用户确认**（需在 UI 卸载重装 0.1.1） |
+| 真机闭环 | ZCode 桌面端实跑（会话 `sess_40370cc0`）| 通过：17 次工具调用、worker 子代理读/确认/编辑/上报全部成功、工单 completed |

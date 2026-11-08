@@ -62,11 +62,19 @@ tick 发放的是**租约**而非终态：未被确认的动作在十分钟后�
 操作控制：`superagent_ticket_retry`、`superagent_ticket_stop`、`superagent_ticket_status`、`superagent_thread_unsubscribe`、`superagent_decision_dismiss`、`superagent_trigger_requeue`。
 执行器：`superagent_worker_read`、`superagent_worker_ack`、`superagent_worker_report`、`superagent_worker_handback`、`superagent_worker_thread_unrelated`、`superagent_worker_thread_follow`。
 
+## 安装（ZCode）
+
+插件已带构建产物（`lib/` 已提交），安装只需要 `PATH` 上有 Node >= 22.5 —— 不需要构建，也不需要为插件本身跑 `npm install`。
+
+1. 设置 → 插件管理 → 把本仓库目录添加为本地市场，或把插件目录复制进已有市场。
+2. 安装 `open-superagent`，然后**新开一个会话**：MCP 工具在会话启动时挂载，已开着的会话仍持有旧工具列表。
+3. 在新会话里直接让 daemon 说话——`superagent_status`——确认它应答。
+
 ## 开发
 
 ```
 npm ci
-npm run check        # 类型检查 + 178 个测试 + 构建到 lib/ + agent 工具名守卫
+npm run check        # 类型检查 + 188 个测试 + 构建到 lib/ + agent 工具名守卫
 node scripts/smoke-stdio.mjs
 ```
 
@@ -76,9 +84,13 @@ node scripts/smoke-stdio.mjs
 
 状态目录取 `OPEN_SUPERAGENT_STATE_DIR`；未设置时使用 `~/.open-superagent/projects/<项目哈希>`，避免两个仓库共用一份工单库。早期版本写在 `~/.open-superagent` 的库仍会被沿用，升级不丢工单。
 
-每张工单的目录是项目仓库 `<stateDir>/work/` 下的分离工作树；只有干净的工作树会被移除，有未提交内容的一律保留供检查。把 `executor.worktree` 设为 `false` 可改为空目录。
+每张工单的目录是项目仓库 `<stateDir>/work/` 下的分离工作树；工单结束后工作树保留，供你审阅改动。把 `executor.worktree` 设为 `false` 可改为空目录。
 
-同一状态目录只允许一个 daemon：在同一项目里打开第二个会话会以退出码 3 失败，并在 stderr 指明目录。这是单写者设计的必然结果。
+同一项目可以同时开多个会话：它们共用一份数据库，只有一个负责调度（派发 effect、运行 passes），其余正常提供全部工具，并在前者关闭后接管调度。
+
+## 工单不做什么
+
+worker 只改自己的分离工作树，主检出不受影响，也不会有任何东西自动合并回来。读完 worker 的报告后，需要你自己应用或丢弃那个工作树。把这条链路接到 PR 上是 GitHub Source 阶段的事。
 
 ## 信任边界
 

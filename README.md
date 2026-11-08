@@ -56,11 +56,22 @@ Operator controls: `superagent_ticket_retry`, `superagent_ticket_stop`, `superag
 Worker: `superagent_worker_read`, `superagent_worker_ack`, `superagent_worker_report`, `superagent_worker_handback`,
 `superagent_worker_thread_unrelated`, `superagent_worker_thread_follow`.
 
+## Install (ZCode)
+
+The plugin ships prebuilt (`lib/` is committed), so installing needs only Node >= 22.5 on `PATH` — no build step and no
+`npm install` for the plugin itself.
+
+1. Settings → Plugin Management → add this repository's directory as a local marketplace, or copy the plugin directory into
+   an existing one.
+2. Install `open-superagent`, then **open a new session**: MCP tools are attached when a session starts, so a session that
+   was already open keeps its old tool list.
+3. In the new session, ask for the daemon directly — `superagent_status` — to confirm it answers.
+
 ## Development
 
 ```
 npm ci
-npm run check        # typecheck + 178 tests + build to lib/ + agent tool-name guard
+npm run check        # typecheck + 188 tests + build to lib/ + agent tool-name guard
 node scripts/smoke-stdio.mjs
 ```
 
@@ -73,12 +84,19 @@ State lives under `OPEN_SUPERAGENT_STATE_DIR` when set, else `~/.open-superagent
 repositories never share one ticket database. A state directory written by an older build at `~/.open-superagent` is still
 used, so an upgrade keeps its tickets.
 
-Each ticket directory is a detached git worktree of the project repository under `<stateDir>/work/`. Worktrees are removed
-only when clean; a dirty one stays for inspection. Set `executor.worktree` to `false` to give workers an empty directory
-instead.
+Each ticket directory is a detached git worktree of the project repository under `<stateDir>/work/`. A worktree is left in
+place after the ticket ends so the change can be reviewed; set `executor.worktree` to `false` to give workers an empty
+directory instead.
 
-Only one daemon may own a state directory. Opening a second session in the same project fails with exit code 3 and a
-message naming the directory.
+Several sessions in the same project can run at once. They share one database, and only one of them schedules (dispatches
+effects and runs passes); the others serve every tool normally and take the scheduling lease over when the leading session
+closes.
+
+## What a ticket does not do
+
+A worker edits its own detached worktree; the main checkout stays untouched, and nothing merges the result back
+automatically. Read the worker's report, then apply or discard that worktree yourself. Wiring the loop to pull requests is
+the GitHub Source phase.
 
 ## Trust boundary
 
